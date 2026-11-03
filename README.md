@@ -21,6 +21,7 @@ Source token:
 - `org:read`
 - `project:read`
 - `member:read`
+- `team:read`
 - `alerts:read`
 
 Destination token:
