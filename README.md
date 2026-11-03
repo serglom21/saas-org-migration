@@ -16,11 +16,14 @@ pip install -e .
 
 Create one org auth token in the source organization and one in the destination organization. Each token is limited to that organization and region.
 
+To create the token, go to Settings -> Integrations -> Custom Integrations and create a new Internal integration. In the creation page, choose any name (Relocation Integration for example) and set the following permissions:
+
 Source token:
 
 - `org:read`
 - `project:read`
 - `member:read`
+- `team:read`
 - `alerts:read`
 
 Destination token:
@@ -32,6 +35,8 @@ Destination token:
 Add `member:write` on the destination token only if you pass `--send-invites`. Inviting someone as owner can require `member:admin`.
 
 These scopes are separate. `org:write` does not include `project:write` or `member:read`.
+
+After the integration is created, scroll down to "Token" and click "+ New Token" to create an auth token.
 
 Do not commit the tokens. Pass them as environment variables:
 
