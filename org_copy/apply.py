@@ -2,23 +2,26 @@
 
 from __future__ import annotations
 
+from collections import Counter
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any
 
 from org_copy.client import ApiError, SentryClient
 from org_copy.export import ALL_PROJECTS
 from org_copy.files import write_json
+from org_copy.progress import Progress
 from org_copy.redact import error_text
 from org_copy.remap import (
     PROJECT_OPTION_KEYS,
     build_user_map,
-    classic_rule_body,
     dashboard_body,
     detector_create_body,
+    explore_query_body,
     fields_to_drop,
     issue_view_body,
     member_email,
-    metric_rule_body,
     optional_org_body,
     org_settings_body,
     project_settings_body,
@@ -35,6 +38,8 @@ CREATED_DETECTOR_TYPES = {
     "uptime_domain_failure": uptime_detector_body,
 }
 CRON_DETECTOR_TYPE = "monitor_check_in_failure"
+# Sections apply_snapshot always runs, including Reading the destination. The tests check [13/13].
+APPLY_SECTIONS = 12
 
 
 @dataclass
@@ -47,6 +52,58 @@ class ApplyOptions:
 
 
 @dataclass
+class SectionResult:
+    label: str
+    # What the section did, such as "30 created, 120 related changes".
+    summary: str
+    actions: list[str] = field(default_factory=list)
+    failures: list[dict[str, str]] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class ObjectKind:
+    """One kind of object, such as projects, for counting a section by object."""
+
+    label: str
+    section: str
+    # How the Sink summaries and failure steps for this kind start.
+    prefixes: tuple[str, ...]
+    count: Callable[[dict[str, Any]], int]
+    # How apply decides that the destination already has one.
+    match: str
+
+
+def _count(key: str) -> Callable[[dict[str, Any]], int]:
+    return lambda snapshot: len(snapshot.get(key) or [])
+
+
+OBJECT_KINDS = (
+    ObjectKind("Teams", "Teams", ("team ",), _count("teams"), "same slug"),
+    ObjectKind("Projects", "Projects", ("project ",), _count("projects"), "same slug, its settings are updated"),
+    ObjectKind("Data forwarders", "Data forwarders", ("forwarder ",), _count("forwarders"), "same provider, updated"),
+    ObjectKind("Cron monitors", "Cron monitors", ("cron monitor ",), _count("monitors"), "same slug"),
+    ObjectKind(
+        "Monitors",
+        "Monitors",
+        ("detector ",),
+        lambda snapshot: len(_iter_detectors(snapshot)),
+        "same name in the same project",
+    ),
+    ObjectKind("Alerts", "Alerts", ("workflow ",), _count("workflows"), "same name and monitors"),
+    ObjectKind("Dashboards", "Dashboards", ("dashboard ",), _count("dashboards"), "same title"),
+    ObjectKind("Saved queries", "Saved queries", ("saved query ",), _count("savedQueries"), "same name"),
+    ObjectKind("Explore saved queries", "Saved queries", ("explore query ",), _count("exploreQueries"), "same name"),
+    ObjectKind(
+        "Issue views",
+        "Issue views",
+        ("issue view ",),
+        lambda snapshot: len(_issue_views(snapshot)),
+        "same name and query",
+    ),
+)
+
+
+@dataclass
 class ApplyReport:
     actions: list[str] = field(default_factory=list)
     failures: list[dict[str, str]] = field(default_factory=list)
@@ -55,6 +112,7 @@ class ApplyReport:
     rejected_org_fields: list[str] = field(default_factory=list)
     rejected_project_options: list[dict[str, str]] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
+    sections: list[SectionResult] = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
@@ -67,8 +125,11 @@ class Sink:
         self.report = report
         self.dry_run = dry_run
         self._seq = 0
+        # Summaries created in this run, to tell duplicates in the source from objects already there.
+        self._created: set[str] = set()
 
     def post(self, path: str, body: dict[str, Any], summary: str) -> dict[str, Any]:
+        self._created.add(summary)
         if self.dry_run:
             self.report.actions.append(f"create {summary}")
             self._seq += 1
@@ -92,7 +153,12 @@ class Sink:
         self.report.actions.append(f"updated {summary}")
         return result
 
-    def skip(self, summary: str) -> None:
+    def skip(self, summary: str, not_copied: str | None = None) -> None:
+        """Record an object that is not created: already in the destination, or not copied for a reason."""
+        if not_copied is None and summary in self._created:
+            not_copied = "duplicate of another in the source"
+        if not_copied:
+            summary += f"{NOT_COPIED_START}{not_copied})"
         self.report.actions.append(f"skip {summary}")
 
 
@@ -105,7 +171,13 @@ def apply_snapshot(
 ) -> ApplyReport:
     report = ApplyReport()
     sink = Sink(client, report, options.dry_run)
-    dest = _DestIndex.load(client, report)
+    title = f"Comparing with {client.org}. Nothing is written yet." if options.dry_run else f"Writing to {client.org}"
+    optional = (options.send_invites, options.hide_environments, options.apply_replay_access)
+    progress = Progress(title, APPLY_SECTIONS + sum(optional))
+    with progress.section("Reading the destination") as summary:
+        dest = _DestIndex.load(client, report)
+        if dest is None:
+            summary.append("failed")
     if dest is None:
         return report
     user_map = build_user_map(snapshot.get("members") or [], dest.members)
@@ -113,32 +185,104 @@ def apply_snapshot(
     project_map: dict[str, str] = {}
     detector_map: dict[str, str] = {}
 
-    _apply_org(snapshot, sink, dest, report)
-    _apply_teams(snapshot, sink, dest, state, state_path, options, team_map)
-    _apply_existing_member_teams(snapshot, sink, dest, report)
-    _apply_projects(snapshot, client, sink, dest, state, state_path, options, report, team_map, project_map)
-    _apply_forwarders(snapshot, sink, dest, state, state_path, options, project_map, report)
-    _apply_monitors(snapshot, sink, dest, state, state_path, options, team_map, user_map, project_map, report)
-    # New projects and cron monitors get their own detectors. Alerts connect to those.
-    dest.load_detectors(client, report)
-    _apply_detectors(snapshot, sink, dest, state, state_path, options, team_map, user_map, project_map, detector_map, report)
-    _apply_workflows(snapshot, sink, dest, state, state_path, options, team_map, user_map, detector_map, report)
-    names = {workflow.get("name") for workflow in snapshot.get("workflows") or []}
-    _apply_legacy_rules(snapshot, sink, dest, state, state_path, options, team_map, user_map, names, report)
-    _apply_metric_rules(snapshot, sink, dest, state, state_path, options, team_map, user_map, names, report)
-    _apply_dashboards(snapshot, sink, dest, state, state_path, options, team_map, project_map, report)
-    _apply_queries(snapshot, sink, dest, state, state_path, options, project_map, report)
-    _apply_recent_searches(snapshot, sink, dest, report)
-    _apply_views(snapshot, sink, dest, state, state_path, options, project_map, report)
+    with _section(progress, report, "Organization settings"):
+        _apply_org(snapshot, sink, dest, report)
+    with _section(progress, report, "Teams"):
+        _apply_teams(snapshot, sink, dest, state, state_path, options, team_map)
+    with _section(progress, report, "Team memberships"):
+        _apply_existing_member_teams(snapshot, sink, dest, report)
+    with _section(progress, report, "Projects"):
+        _apply_projects(snapshot, client, sink, dest, state, state_path, options, report, team_map, project_map, progress)
+    with _section(progress, report, "Data forwarders"):
+        _apply_forwarders(snapshot, sink, dest, state, state_path, options, project_map, report)
+    with _section(progress, report, "Cron monitors"):
+        _apply_monitors(snapshot, sink, dest, state, state_path, options, team_map, user_map, project_map, report, progress)
+    with _section(progress, report, "Monitors"):
+        # New projects and cron monitors get their own detectors. Alerts connect to those.
+        dest.load_detectors(client, report)
+        _apply_detectors(
+            snapshot, sink, dest, state, state_path, options, team_map, user_map, project_map, detector_map, report, progress
+        )
+    with _section(progress, report, "Alerts"):
+        _apply_workflows(snapshot, sink, dest, state, state_path, options, team_map, user_map, detector_map, report, progress)
+    with _section(progress, report, "Dashboards"):
+        _apply_dashboards(snapshot, sink, dest, state, state_path, options, team_map, project_map, report, progress)
+    with _section(progress, report, "Saved queries"):
+        _apply_queries(snapshot, sink, dest, state, state_path, options, project_map, report)
+        _apply_explore_queries(snapshot, sink, dest, state, state_path, options, project_map, report)
+    with _section(progress, report, "Issue views"):
+        _apply_views(snapshot, sink, dest, state, state_path, options, project_map, report)
     if options.send_invites:
-        _apply_invites(snapshot, sink, dest, report)
+        with _section(progress, report, "Invites"):
+            _apply_invites(snapshot, sink, dest, report)
     else:
-        report.notes.append("Member invites were not sent. Re-run apply with --send-invites.")
+        report.notes.append(
+            "Member invites were not sent. Run org-copy again and answer y when it asks about invites, "
+            "or run `org-copy apply --send-invites`."
+        )
     if options.hide_environments:
-        _apply_hidden_environments(snapshot, sink, report)
+        with _section(progress, report, "Hidden environments"):
+            _apply_hidden_environments(snapshot, sink, report)
     if options.apply_replay_access:
-        _apply_replay(snapshot, sink, dest, report)
+        with _section(progress, report, "Replay access"):
+            _apply_replay(snapshot, sink, dest, report)
     return report
+
+
+@contextmanager
+def _section(progress: Progress, report: ApplyReport, label: str) -> Iterator[None]:
+    """Run one apply section and summarize the actions and failures it added."""
+    start_actions, start_failures = len(report.actions), len(report.failures)
+    with progress.section(label) as summary:
+        yield
+        actions = report.actions[start_actions:]
+        failures = report.failures[start_failures:]
+        summary.extend(_summarize_actions(actions, failures, _section_prefixes(label)))
+        report.sections.append(SectionResult(label, ", ".join(summary), actions, failures))
+
+
+def _section_prefixes(label: str) -> tuple[str, ...]:
+    return tuple(prefix for kind in OBJECT_KINDS if kind.section == label for prefix in kind.prefixes)
+
+
+# Marks a skip that is not copied, as in "skip dashboard Errors (not copied: prebuilt)".
+NOT_COPIED_START = " (not copied: "
+
+
+def action_outcome(action: str) -> str:
+    """Name what an action does to its object: create, created, update, updated, existing, or not copied."""
+    verb, _, rest = action.partition(" ")
+    if verb != "skip":
+        return verb
+    return "not copied" if NOT_COPIED_START in rest else "existing"
+
+
+# How each outcome reads in a section summary.
+_SUMMARY_WORDS = {
+    "create": "to create",
+    "created": "created",
+    "update": "to update",
+    "updated": "updated",
+    "existing": "already there",
+    "not copied": "not copied",
+}
+
+
+def _summarize_actions(actions: list[str], failures: list[dict[str, str]], prefixes: tuple[str, ...]) -> list[str]:
+    """Count the section's objects by outcome. Other actions, such as project keys, count as related changes."""
+    outcomes: Counter[str] = Counter()
+    related = 0
+    for action in actions:
+        if prefixes and not action.partition(" ")[2].startswith(prefixes):
+            related += 1
+        else:
+            outcomes[action_outcome(action)] += 1
+    summary = [f"{count} {_SUMMARY_WORDS.get(outcome, outcome)}" for outcome, count in outcomes.items()]
+    if related:
+        summary.append(f"{related} related changes")
+    if failures:
+        summary.append(f"{len(failures)} failed")
+    return summary or ["nothing to copy"]
 
 
 class _DestIndex:
@@ -152,13 +296,11 @@ class _DestIndex:
         self.monitors_by_slug: dict[str, dict[str, Any]] = {}
         self.dashboards_by_title: dict[str, dict[str, Any]] = {}
         self.queries_by_name: dict[str, dict[str, Any]] = {}
-        self.recent_searches: list[dict[str, Any]] = []
-        self.views_by_name: dict[str, dict[str, Any]] = {}
+        self.explore_queries_by_name: dict[str, dict[str, Any]] = {}
+        self.view_keys: set[tuple[str, str]] = set()
         self.forwarders_by_provider: dict[str, dict[str, Any]] = {}
-        self.alert_rules_by_name: dict[str, dict[str, Any]] = {}
         self.detectors: list[dict[str, Any]] = []
         self.detectors_by_key: dict[str, dict[str, Any]] = {}
-        self.rules_by_key: dict[str, dict[str, Any]] = {}
 
     @classmethod
     def load(cls, client: SentryClient, report: ApplyReport) -> _DestIndex | None:
@@ -190,30 +332,20 @@ class _DestIndex:
         )
         index.dashboards_by_title = _by(client, f"/organizations/{client.org}/dashboards/", "title", report, "dashboards")
         index.queries_by_name = _by(client, f"/organizations/{client.org}/discover/saved/", "name", report, "saved queries")
-        recent, recent_error = client.get_optional_list(f"/organizations/{client.org}/recent-searches/", LIST_PARAMS)
-        if recent_error and recent_error.status != 404:
-            report.failures.append({"step": "list destination recent searches", "detail": error_text(recent_error)})
-        index.recent_searches = recent
+        index.explore_queries_by_name = _by(
+            client, f"/organizations/{client.org}/explore/saved/", "name", report, "explore saved queries"
+        )
         views, view_error = client.get_optional_list(
             f"/organizations/{client.org}/group-search-views/",
             {"createdBy": "me", **LIST_PARAMS},
         )
         if view_error and view_error.status != 404:
             report.failures.append({"step": "list destination issue views", "detail": error_text(view_error)})
-        index.views_by_name = {item.get("name"): item for item in views if item.get("name")}
+        index.view_keys = {_view_key(item) for item in views if item.get("name")}
         forwarders, forward_error = client.get_optional_list(f"/organizations/{client.org}/forwarding/")
         if forward_error and forward_error.status != 404:
             report.failures.append({"step": "list destination forwarders", "detail": error_text(forward_error)})
         index.forwarders_by_provider = {item.get("provider"): item for item in forwarders if item.get("provider")}
-        index.alert_rules_by_name = _by(client, f"/organizations/{client.org}/alert-rules/", "name", report, "metric alerts")
-        for project in index.projects_by_slug.values():
-            slug = project.get("slug")
-            rules, rule_error = client.get_optional_list(f"/projects/{client.org}/{slug}/rules/")
-            if rule_error and rule_error.status != 404:
-                report.failures.append({"step": f"list rules {slug}", "detail": error_text(rule_error)})
-            for rule in rules:
-                if rule.get("name"):
-                    index.rules_by_key[f"{slug}:{rule['name']}"] = rule
         return index
 
     def load_detectors(self, client: SentryClient, report: ApplyReport) -> None:
@@ -286,10 +418,11 @@ def _apply_org(snapshot: dict[str, Any], sink: Sink, dest: _DestIndex, report: A
     organization = snapshot.get("organization") or {}
     body = org_settings_body(organization)
     if not body:
-        sink.skip("org settings (nothing to copy)")
+        sink.skip("org settings", "nothing to copy")
         return
     try:
-        _put_dropping(sink, f"/organizations/{sink.client.org}/", body, "org settings")
+        _result, dropped = _put_dropping(sink, f"/organizations/{sink.client.org}/", body, "org settings")
+        report.rejected_org_fields.extend(dropped)
     except ApiError as exc:
         _fail(report, "org settings", exc)
     for field, value in optional_org_body(organization).items():
@@ -298,7 +431,6 @@ def _apply_org(snapshot: dict[str, Any], sink: Sink, dest: _DestIndex, report: A
         except ApiError as exc:
             if exc.status == 400:
                 report.rejected_org_fields.append(field)
-                report.notes.append(f"Org field {field} was rejected and left for the UI.")
             else:
                 _fail(report, f"org {field}", exc)
 
@@ -393,9 +525,10 @@ def _apply_projects(
     report: ApplyReport,
     team_map: dict[str, str],
     project_map: dict[str, str],
+    progress: Progress,
 ) -> None:
     org = client.org
-    for project in snapshot.get("projects") or []:
+    for project in progress.items(snapshot.get("projects") or []):
         slug = project.get("slug")
         if not slug:
             continue
@@ -705,9 +838,10 @@ def _apply_detectors(
     project_map: dict[str, str],
     detector_map: dict[str, str],
     report: ApplyReport,
+    progress: Progress,
 ) -> None:
     org = sink.client.org
-    for slug, detector in _iter_detectors(snapshot):
+    for slug, detector in progress.items(_iter_detectors(snapshot)):
         name = detector.get("name") or "monitor"
         kind = str(detector.get("type") or "")
         source_id = str(detector.get("id"))
@@ -716,8 +850,10 @@ def _apply_detectors(
             existing = _existing_dest_detector(detector, dest, project_map)
             if existing:
                 detector_map[source_id] = str(existing.get("id"))
+                sink.skip(f"detector {name} on {slug}", "built in, the destination has its own")
             elif sink.dry_run and _planned(detector, dest, project_map):
                 detector_map[source_id] = f"{kind} on {slug}"
+                sink.skip(f"detector {name} on {slug}", "built in, the new project gets its own")
             else:
                 report.failures.append(
                     {
@@ -757,11 +893,13 @@ def _apply_workflows(
     user_map: dict[str, str],
     detector_map: dict[str, str],
     report: ApplyReport,
+    progress: Progress,
 ) -> None:
     org = sink.client.org
-    for workflow in snapshot.get("workflows") or []:
+    for workflow in progress.items(snapshot.get("workflows") or []):
         name = workflow.get("name")
         if not name:
+            sink.skip("workflow ", "no name")
             continue
         unmapped = [str(item) for item in workflow.get("detectorIds") or [] if str(item) not in detector_map]
         if unmapped:
@@ -790,89 +928,6 @@ def _apply_workflows(
         _remember(state, "workflows", workflow.get("id"), created.get("id"), state_path, options.dry_run)
 
 
-def _apply_legacy_rules(
-    snapshot: dict[str, Any],
-    sink: Sink,
-    dest: _DestIndex,
-    state: dict[str, Any],
-    state_path: str,
-    options: ApplyOptions,
-    team_map: dict[str, str],
-    user_map: dict[str, str],
-    workflow_names: set[Any],
-    report: ApplyReport,
-) -> None:
-    org = sink.client.org
-    for project in snapshot.get("projects") or []:
-        slug = project.get("slug")
-        for rule in project.get("rules") or []:
-            name = rule.get("name")
-            if not name or not slug:
-                continue
-            if name in workflow_names:
-                sink.skip(f"issue rule {name} on {slug} (workflow with the same name)")
-                continue
-            if dest.rules_by_key.get(f"{slug}:{name}"):
-                sink.skip(f"issue rule {name} on {slug}")
-                continue
-            owner = remap_owner(rule.get("owner"), team_map, user_map)
-            body, dropped = classic_rule_body(rule, owner, user_map, team_map)
-            for action in dropped:
-                report.dropped_actions.append({"rule": name, "action": action})
-            try:
-                created = sink.post(f"/projects/{org}/{slug}/rules/", body, f"issue rule {name} on {slug}")
-            except ApiError as exc:
-                _fail(report, f"issue rule {name} on {slug}", exc)
-                continue
-            dest.rules_by_key[f"{slug}:{name}"] = created
-            _remember(state, "rules", rule.get("id"), created.get("id"), state_path, options.dry_run)
-
-
-def _metric_project_slugs(rule: dict[str, Any], snapshot: dict[str, Any]) -> list[str]:
-    wanted = {str(project_id) for project_id in rule.get("projects") or []}
-    slugs = []
-    for project in snapshot.get("projects") or []:
-        if str(project.get("id")) in wanted or project.get("slug") in wanted:
-            slugs.append(project["slug"])
-    return slugs
-
-
-def _apply_metric_rules(
-    snapshot: dict[str, Any],
-    sink: Sink,
-    dest: _DestIndex,
-    state: dict[str, Any],
-    state_path: str,
-    options: ApplyOptions,
-    team_map: dict[str, str],
-    user_map: dict[str, str],
-    workflow_names: set[Any],
-    report: ApplyReport,
-) -> None:
-    org = sink.client.org
-    for rule in snapshot.get("alertRules") or []:
-        name = rule.get("name")
-        if not name:
-            continue
-        if name in workflow_names:
-            sink.skip(f"metric alert {name} (workflow with the same name)")
-            continue
-        if dest.alert_rules_by_name.get(name):
-            sink.skip(f"metric alert {name}")
-            continue
-        owner = remap_owner(rule.get("owner"), team_map, user_map)
-        body, dropped = metric_rule_body(rule, _metric_project_slugs(rule, snapshot), owner, user_map, team_map)
-        for action in dropped:
-            report.dropped_actions.append({"rule": name, "action": action})
-        try:
-            created = sink.post(f"/organizations/{org}/alert-rules/", body, f"metric alert {name}")
-        except ApiError as exc:
-            _fail(report, f"metric alert {name}", exc)
-            continue
-        dest.alert_rules_by_name[name] = created
-        _remember(state, "alertRules", rule.get("id"), created.get("id"), state_path, options.dry_run)
-
-
 def _apply_monitors(
     snapshot: dict[str, Any],
     sink: Sink,
@@ -884,10 +939,11 @@ def _apply_monitors(
     user_map: dict[str, str],
     project_map: dict[str, str],
     report: ApplyReport,
+    progress: Progress,
 ) -> None:
     org = sink.client.org
     slug_by_id = {str(project.get("id")): project.get("slug") for project in snapshot.get("projects") or []}
-    for monitor in snapshot.get("monitors") or []:
+    for monitor in progress.items(snapshot.get("monitors") or []):
         slug = monitor.get("slug")
         name = monitor.get("name") or slug
         if not slug:
@@ -928,11 +984,12 @@ def _apply_dashboards(
     team_map: dict[str, str],
     project_map: dict[str, str],
     report: ApplyReport,
+    progress: Progress,
 ) -> None:
     org = sink.client.org
-    for dashboard in snapshot.get("dashboards") or []:
+    for dashboard in progress.items(snapshot.get("dashboards") or []):
         if dashboard.get("prebuiltId"):
-            sink.skip(f"prebuilt dashboard {dashboard.get('title')}")
+            sink.skip(f"dashboard {dashboard.get('title')}", "prebuilt, the destination has its own")
             continue
         title = dashboard.get("title")
         if not title:
@@ -981,28 +1038,38 @@ def _apply_queries(
         _remember(state, "queries", query.get("id"), created.get("id"), state_path, options.dry_run)
 
 
-def _apply_recent_searches(snapshot: dict[str, Any], sink: Sink, dest: _DestIndex, report: ApplyReport) -> None:
+def _apply_explore_queries(
+    snapshot: dict[str, Any],
+    sink: Sink,
+    dest: _DestIndex,
+    state: dict[str, Any],
+    state_path: str,
+    options: ApplyOptions,
+    project_map: dict[str, str],
+    report: ApplyReport,
+) -> None:
     org = sink.client.org
-    seen = {(item.get("type", 0), item.get("query")) for item in dest.recent_searches}
-    for search in snapshot.get("recentSearches") or []:
-        query = search.get("query")
-        if not query:
+    for query in snapshot.get("exploreQueries") or []:
+        name = query.get("name")
+        if not name:
             continue
-        kind = search.get("type", 0)
-        if (kind, query) in seen:
-            sink.skip(f"recent search {query}")
+        if query.get("isPrebuilt"):
+            sink.skip(f"explore query {name}", "prebuilt, the destination has its own")
+            continue
+        if dest.explore_queries_by_name.get(name):
+            sink.skip(f"explore query {name}")
             continue
         try:
             created = sink.post(
-                f"/organizations/{org}/recent-searches/",
-                {"type": kind, "query": query},
-                f"recent search {query}",
+                f"/organizations/{org}/explore/saved/",
+                explore_query_body(query, project_map),
+                f"explore query {name}",
             )
         except ApiError as exc:
-            _fail(report, f"recent search {query}", exc)
+            _fail(report, f"explore query {name}", exc)
             continue
-        dest.recent_searches.append(created if isinstance(created, dict) else {"type": kind, "query": query})
-        seen.add((kind, query))
+        dest.explore_queries_by_name[name] = created
+        _remember(state, "exploreQueries", query.get("id"), created.get("id"), state_path, options.dry_run)
 
 
 def _apply_views(
@@ -1015,31 +1082,39 @@ def _apply_views(
     project_map: dict[str, str],
     report: ApplyReport,
 ) -> None:
+    """Copy the token user's views and the views other members share with the organization.
+
+    The destination creates them all as the token user's, shared with the organization.
+    """
     org = sink.client.org
-    views = (snapshot.get("issueViews") or {}).get("mine") or []
-    for view in views:
+    mine = (snapshot.get("issueViews") or {}).get("mine") or []
+    for view in _issue_views(snapshot):
         name = view.get("name")
         if not name:
             continue
-        if dest.views_by_name.get(name):
+        if _view_key(view) in dest.view_keys:
             sink.skip(f"issue view {name}")
             continue
+        body = issue_view_body(view, project_map)
+        # Starring belongs to the person who starred it, so only the token user's own views keep it.
+        body["starred"] = body["starred"] and view in mine
         try:
-            created = sink.post(
-                f"/organizations/{org}/group-search-views/",
-                issue_view_body(view, project_map),
-                f"issue view {name}",
-            )
+            created = sink.post(f"/organizations/{org}/group-search-views/", body, f"issue view {name}")
         except ApiError as exc:
             _fail(report, f"issue view {name}", exc)
             continue
-        dest.views_by_name[name] = created
+        dest.view_keys.add(_view_key(view))
         _remember(state, "views", view.get("id"), created.get("id"), state_path, options.dry_run)
-    others = (snapshot.get("issueViews") or {}).get("others") or []
-    if others:
-        report.notes.append(
-            f"{len(others)} issue views belong to other members and were listed, not copied."
-        )
+
+
+def _issue_views(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
+    views = snapshot.get("issueViews") or {}
+    return [*(views.get("mine") or []), *(views.get("others") or [])]
+
+
+def _view_key(view: dict[str, Any]) -> tuple[str, str]:
+    """Members often reuse view names, so a view is the same only when its query matches too."""
+    return str(view.get("name")), str(view.get("query") or "")
 
 
 def _apply_invites(snapshot: dict[str, Any], sink: Sink, dest: _DestIndex, report: ApplyReport) -> None:

@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from typing import Any
 
 from org_copy.client import ApiError, SentryClient
+from org_copy.progress import Progress
 from org_copy.redact import error_text, redact
 from org_copy.remap import member_email, replay_emails
 
@@ -12,70 +14,98 @@ LIST_PARAMS = {"per_page": "100"}
 # Without project=-1 these lists only cover the token user's team projects and skip
 # org-level detectors and workflows that are not connected to any monitor.
 ALL_PROJECTS = {"project": "-1", **LIST_PARAMS}
+# Sections export_snapshot runs. The tests check the last one shows [12/12].
+EXPORT_SECTIONS = 12
 
 
 def export_snapshot(client: SentryClient) -> dict[str, Any]:
     org = client.org
     errors: list[dict[str, Any]] = []
-    organization = client.get_json(f"/organizations/{org}/")
-    teams = _required_list(client, f"/organizations/{org}/teams/", {"detailed": "0", **LIST_PARAMS}, "teams", errors)
-    members = _required_list(client, f"/organizations/{org}/members/", LIST_PARAMS, "members", errors)
-    _attach_team_memberships(client, org, teams, members, errors)
-    project_rows = _required_list(
-        client, f"/organizations/{org}/projects/", LIST_PARAMS, "projects", errors
-    )
-    projects = [_export_project(client, org, row, errors) for row in project_rows]
-    projects = [project for project in projects if project is not None]
+    progress = Progress(f"Reading {org}", EXPORT_SECTIONS)
+    with progress.section("Organization settings"):
+        organization = client.get_json(f"/organizations/{org}/")
+    with progress.section("Members") as summary:
+        members = _required_list(client, f"/organizations/{org}/members/", LIST_PARAMS, "members", errors)
+        summary.append(f"{len(members)} found")
+        # The members list leaves out people whose invite or join request still waits for approval.
+        requests, request_error = client.get_optional_list(f"/organizations/{org}/invite-requests/", LIST_PARAMS)
+        _note_optional(errors, "invite requests", request_error)
+        if requests:
+            summary.append(f"{len(requests)} waiting for approval")
+    with progress.section("Teams") as summary:
+        teams = _required_list(client, f"/organizations/{org}/teams/", {"detailed": "0", **LIST_PARAMS}, "teams", errors)
+        _attach_team_memberships(client, org, progress.items(teams), members, errors)
+        summary.append(f"{len(teams)} found")
+    with progress.section("Projects") as summary:
+        project_rows = _required_list(
+            client, f"/organizations/{org}/projects/", LIST_PARAMS, "projects", errors
+        )
+        projects = [_export_project(client, org, row, errors) for row in progress.items(project_rows)]
+        projects = [project for project in projects if project is not None]
+        summary.append(f"{len(projects)} found")
 
-    org_detectors: list[dict[str, Any]] = []
-    detectors, detector_error = client.get_optional_list(f"/organizations/{org}/detectors/", ALL_PROJECTS)
-    if detector_error is None:
-        org_detectors = _attach_detectors(projects, detectors)
-    else:
-        _note_optional(errors, "detectors", detector_error)
-        for project in projects:
-            listed, error = client.get_optional_list(
-                f"/organizations/{org}/projects/{project['slug']}/detectors/",
-                LIST_PARAMS,
-            )
-            if error and error.status != 404:
-                _note_optional(errors, f"detectors {project['slug']}", error)
-            project["detectors"] = listed
+    with progress.section("Monitors") as summary:
+        org_detectors: list[dict[str, Any]] = []
+        detectors, detector_error = client.get_optional_list(f"/organizations/{org}/detectors/", ALL_PROJECTS)
+        if detector_error is None:
+            org_detectors = _attach_detectors(projects, detectors, errors)
+        else:
+            _note_optional(errors, "detectors", detector_error)
+            for project in progress.items(projects):
+                listed, error = client.get_optional_list(
+                    f"/organizations/{org}/projects/{project['slug']}/detectors/",
+                    LIST_PARAMS,
+                )
+                if error and error.status != 404:
+                    _note_optional(errors, f"detectors {project['slug']}", error)
+                project["detectors"] = listed
+        summary.append(f"{len(org_detectors) + sum(len(p['detectors']) for p in projects)} found")
 
-    workflows, workflow_error = client.get_optional_list(f"/organizations/{org}/workflows/", ALL_PROJECTS)
-    _note_optional(errors, "workflows", workflow_error)
-    alert_rules, alert_error = client.get_optional_list(f"/organizations/{org}/alert-rules/", LIST_PARAMS)
-    _note_optional(errors, "alert-rules", alert_error)
-    monitors, monitor_error = client.get_optional_list(f"/organizations/{org}/monitors/", ALL_PROJECTS)
-    _note_optional(errors, "monitors", monitor_error)
-    dashboards = _export_dashboards(client, org, errors)
-    saved_queries, query_error = client.get_optional_list(
-        f"/organizations/{org}/discover/saved/", LIST_PARAMS
-    )
-    _note_optional(errors, "saved queries", query_error)
-    recent_searches, recent_error = client.get_optional_list(
-        f"/organizations/{org}/recent-searches/", LIST_PARAMS
-    )
-    _note_optional(errors, "recent searches", recent_error)
-    my_views, my_error = client.get_optional_list(
-        f"/organizations/{org}/group-search-views/",
-        {"createdBy": "me", **LIST_PARAMS},
-    )
-    _note_optional(errors, "issue views", my_error)
-    other_views, other_error = client.get_optional_list(
-        f"/organizations/{org}/group-search-views/",
-        {"createdBy": "others", **LIST_PARAMS},
-    )
-    _note_optional(errors, "other issue views", other_error)
-    forwarders, forward_error = client.get_optional_list(f"/organizations/{org}/forwarding/")
-    _note_optional(errors, "forwarders", forward_error)
-    integrations, integration_error = client.get_optional_list(f"/organizations/{org}/integrations/")
-    _note_optional(errors, "integrations", integration_error)
-    code_mappings, mapping_error = client.get_optional_list(f"/organizations/{org}/code-mappings/")
-    _note_optional(errors, "code mappings", mapping_error)
-    installations, app_error = client.get_optional_list(f"/organizations/{org}/sentry-app-installations/")
-    _note_optional(errors, "sentry app installations", app_error)
-    auth_provider, _auth_error = client.get_optional(f"/organizations/{org}/auth-provider/")
+    with progress.section("Alerts") as summary:
+        workflows, workflow_error = client.get_optional_list(f"/organizations/{org}/workflows/", ALL_PROJECTS)
+        _note_optional(errors, "workflows", workflow_error)
+        summary.append(f"{len(workflows)} found")
+    with progress.section("Cron monitors") as summary:
+        monitors, monitor_error = client.get_optional_list(f"/organizations/{org}/monitors/", ALL_PROJECTS)
+        _note_optional(errors, "monitors", monitor_error)
+        summary.append(f"{len(monitors)} found")
+    with progress.section("Dashboards") as summary:
+        dashboards = _export_dashboards(client, org, errors, progress)
+        summary.append(f"{len(dashboards)} found")
+    with progress.section("Saved queries") as summary:
+        saved_queries, query_error = client.get_optional_list(
+            f"/organizations/{org}/discover/saved/", LIST_PARAMS
+        )
+        _note_optional(errors, "saved queries", query_error)
+        # Explore holds span, log, and metric queries, plus Discover transaction queries migrated to spans.
+        explore_queries, explore_error = client.get_optional_list(f"/organizations/{org}/explore/saved/", LIST_PARAMS)
+        _note_optional(errors, "explore saved queries", explore_error)
+        summary.append(f"{len(saved_queries) + len(explore_queries)} found")
+    with progress.section("Issue views") as summary:
+        my_views, my_error = client.get_optional_list(
+            f"/organizations/{org}/group-search-views/",
+            {"createdBy": "me", **LIST_PARAMS},
+        )
+        _note_optional(errors, "issue views", my_error)
+        other_views, other_error = client.get_optional_list(
+            f"/organizations/{org}/group-search-views/",
+            {"createdBy": "others", **LIST_PARAMS},
+        )
+        _note_optional(errors, "other issue views", other_error)
+        summary.append(f"{len(my_views) + len(other_views)} found")
+    with progress.section("Data forwarders") as summary:
+        forwarders, forward_error = client.get_optional_list(f"/organizations/{org}/forwarding/")
+        _note_optional(errors, "forwarders", forward_error)
+        summary.append(f"{len(forwarders)} found")
+    with progress.section("Integrations, apps, and auth tokens"):
+        integrations, integration_error = client.get_optional_list(f"/organizations/{org}/integrations/")
+        _note_optional(errors, "integrations", integration_error)
+        code_mappings, mapping_error = client.get_optional_list(f"/organizations/{org}/code-mappings/")
+        _note_optional(errors, "code mappings", mapping_error)
+        installations, app_error = client.get_optional_list(f"/organizations/{org}/sentry-app-installations/")
+        _note_optional(errors, "sentry app installations", app_error)
+        auth_provider, _auth_error = client.get_optional(f"/organizations/{org}/auth-provider/")
+        auth_tokens = _export_auth_tokens(client, org, errors)
 
     return {
         "source": {
@@ -90,22 +120,26 @@ def export_snapshot(client: SentryClient) -> dict[str, Any]:
         "projects": projects,
         "orgDetectors": org_detectors,
         "workflows": workflows,
-        "alertRules": alert_rules,
         "monitors": monitors,
         "dashboards": dashboards,
         "savedQueries": saved_queries,
-        "recentSearches": [
-            {"id": str(item.get("id") or ""), "type": item.get("type", 0), "query": item.get("query") or ""}
-            for item in recent_searches
-            if isinstance(item, dict) and item.get("query")
-        ],
+        "exploreQueries": explore_queries,
         "issueViews": {"mine": my_views, "others": other_views},
         "forwarders": forwarders,
         "integrations": [_public_integration(item) for item in integrations],
         "codeMappings": [_public_code_mapping(item) for item in code_mappings],
         "sentryAppInstallations": [_public_installation(item) for item in installations],
-        "authTokens": _export_auth_tokens(client, org, errors),
+        "authTokens": auth_tokens,
         "authProvider": auth_provider if isinstance(auth_provider, dict) else None,
+        "inviteRequests": [
+            {
+                "email": item.get("email"),
+                "role": item.get("orgRole") or item.get("role"),
+                "inviteStatus": item.get("inviteStatus"),
+            }
+            for item in requests
+            if isinstance(item, dict) and item.get("email")
+        ],
         "exportErrors": errors,
     }
 
@@ -132,8 +166,6 @@ def _export_project(
         f"/projects/{org}/{slug}/environments/", {"visibility": "all"}
     )
     _note_optional(errors, f"environments {slug}", env_error)
-    rules, rule_error = client.get_optional_list(f"/projects/{org}/{slug}/rules/")
-    _note_optional(errors, f"rules {slug}", rule_error)
     codeowners, owner_error = client.get_optional_list(f"/projects/{org}/{slug}/codeowners/")
     if owner_error and owner_error.status != 404:
         _note_optional(errors, f"codeowners {slug}", owner_error)
@@ -156,7 +188,6 @@ def _export_project(
         "hiddenEnvironments": [
             env.get("name") for env in environments if isinstance(env, dict) and env.get("isHidden") and env.get("name")
         ],
-        "rules": rules,
         "codeowners": codeowners,
         "serviceHooks": [_public_hook(hook) for hook in hooks],
         "latestRelease": latest.get("version"),
@@ -164,11 +195,13 @@ def _export_project(
     }
 
 
-def _export_dashboards(client: SentryClient, org: str, errors: list[dict[str, Any]]) -> list[Any]:
+def _export_dashboards(
+    client: SentryClient, org: str, errors: list[dict[str, Any]], progress: Progress
+) -> list[Any]:
     summaries, error = client.get_optional_list(f"/organizations/{org}/dashboards/", LIST_PARAMS)
     _note_optional(errors, "dashboards", error)
     detailed: list[Any] = []
-    for summary in summaries:
+    for summary in progress.items(summaries):
         dashboard_id = summary.get("id")
         if not dashboard_id:
             continue
@@ -195,7 +228,7 @@ def _export_auth_tokens(client: SentryClient, org: str, errors: list[dict[str, A
 def _attach_team_memberships(
     client: SentryClient,
     org: str,
-    teams: list[dict[str, Any]],
+    teams: Iterable[dict[str, Any]],
     members: list[dict[str, Any]],
     errors: list[dict[str, Any]],
 ) -> None:
@@ -232,17 +265,34 @@ def _default_team_role(member: dict[str, Any]) -> str | None:
     return None
 
 
-def _attach_detectors(projects: list[dict[str, Any]], detectors: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Attach detectors to their projects and return the org-level ones, such as the all-projects detector."""
+def _attach_detectors(
+    projects: list[dict[str, Any]], detectors: list[dict[str, Any]], errors: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Attach detectors to their projects and return the org-level ones, such as the all-projects detector.
+
+    A detector whose project was not read cannot be copied, so it is reported instead.
+    """
     by_id = {project["id"]: project for project in projects if project.get("id")}
     org_level = []
+    unread: dict[str, list[str]] = {}
     for detector in detectors:
         if not detector.get("projectId"):
             org_level.append(detector)
             continue
         project = by_id.get(str(detector["projectId"]))
-        if project is not None:
+        if project is None:
+            unread.setdefault(str(detector["projectId"]), []).append(str(detector.get("name") or detector.get("id")))
+        else:
             project["detectors"].append(detector)
+    for project_id, names in unread.items():
+        shown = ", ".join(names[:3]) + (f", and {len(names) - 3} more" if len(names) > 3 else "")
+        errors.append(
+            {
+                "step": f"monitors in project {project_id}",
+                "status": 0,
+                "detail": f"the project was not read, so these monitors were not copied ({len(names)}): {shown}",
+            }
+        )
     return org_level
 
 

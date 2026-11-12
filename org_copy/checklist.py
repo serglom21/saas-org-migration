@@ -107,7 +107,11 @@ def _section_review(lines: list[str], snapshot: dict[str, Any]) -> None:
         ("Uptime monitors", detector_types.count("uptime_domain_failure")),
         ("Custom dashboards", sum(1 for item in snapshot.get("dashboards") or [] if not item.get("prebuiltId"))),
         ("Discover saved queries", len(snapshot.get("savedQueries") or [])),
-        ("Issue views of the token user", len((snapshot.get("issueViews") or {}).get("mine") or [])),
+        ("Explore saved queries", sum(1 for item in snapshot.get("exploreQueries") or [] if not item.get("isPrebuilt"))),
+        (
+            "Issue views shared with the organization",
+            sum(len(views) for views in (snapshot.get("issueViews") or {}).values()),
+        ),
         ("Data forwarders", len(snapshot.get("forwarders") or [])),
     )
     lines.extend(
@@ -136,15 +140,20 @@ def _section_review(lines: list[str], snapshot: dict[str, Any]) -> None:
     )
 
 
-def _section_finish(lines: list[str], snapshot: dict[str, Any]) -> None:
-    lines.extend(["## Finish by hand", ""])
-    admins = [
+def team_admins_to_set(snapshot: dict[str, Any]) -> list[str]:
+    """Members who were team admins in the source. Invites don't copy team roles."""
+    return [
         f"{member_email(member)} on {item.get('teamSlug')}"
         for member in snapshot.get("members") or []
         if (member.get("orgRole") or "member") == "member"
         for item in member.get("teamRoles") or []
         if isinstance(item, dict) and item.get("role") == "admin"
     ]
+
+
+def _section_finish(lines: list[str], snapshot: dict[str, Any]) -> None:
+    lines.extend(["## Finish by hand", ""])
+    admins = team_admins_to_set(snapshot)
     if admins:
         lines.append(
             "- Invites do not copy team roles. After people accept, make them team admins in the UI "
@@ -160,9 +169,10 @@ def _section_finish(lines: list[str], snapshot: dict[str, Any]) -> None:
             "Enter them again after the people they name join.",
         ]
     )
-    others = len((snapshot.get("issueViews") or {}).get("others") or [])
-    if others:
-        lines.append(f"- Issue views that belong to other members: {others}. Each member recreates their own.")
+    lines.append(
+        "- Issue views that members kept private are not copied. Sentry does not return them, "
+        "so each member recreates their own."
+    )
     lines.append("")
 
 
@@ -180,6 +190,7 @@ def _section_gaps(lines: list[str]) -> None:
             "- Uptime monitors fail to create when the destination has no uptime seats left.",
             "- Auto-detected uptime monitors are created as manual monitors.",
             "- Two metric monitors with the same name in one project are copied as one.",
+            "- Recent searches are not copied. Sentry only returns the token's own, so each person's start empty.",
             "",
         ]
     )
@@ -315,6 +326,16 @@ def _section_members(lines: list[str], snapshot: dict[str, Any]) -> None:
     for member in snapshot.get("members") or []:
         teams = ", ".join(member.get("teamSlugs") or []) or "no teams"
         lines.append(f"- {member_email(member)} role `{member.get('orgRole')}` teams: {teams}")
+    requests = snapshot.get("inviteRequests") or []
+    if requests:
+        lines.extend(
+            [
+                "",
+                "Waiting for approval in the source, so not invited. Approve them in the source and export again, "
+                "or invite them in the destination:",
+            ]
+        )
+        lines.extend(f"- {item.get('email')} role `{item.get('role')}`" for item in requests)
     lines.append("")
 
 

@@ -244,40 +244,9 @@ def kept_workflow_action(
     }
 
 
-def kept_classic_action(
-    action: dict[str, Any], user_map: dict[str, str], team_map: dict[str, str]
-) -> dict[str, Any] | None:
-    target = str(action.get("targetType") or "").lower()
-    ident = action.get("targetIdentifier")
-    body: dict[str, Any] = {}
-    if action.get("id"):
-        body["id"] = action["id"]
-    if action.get("type"):
-        body["type"] = action["type"]
-    for key in ("targetType", "fallthroughType"):
-        if key in action:
-            body[key] = action[key]
-    if target in {"member", "user"}:
-        dest = _map_ident(ident, user_map)
-        if ident not in (None, "") and dest is None:
-            return None
-        if dest is not None:
-            body["targetIdentifier"] = dest
-    elif target == "team":
-        dest = _map_ident(ident, team_map)
-        if ident not in (None, "") and dest is None:
-            return None
-        if dest is not None:
-            body["targetIdentifier"] = dest
-    elif "targetIdentifier" in action:
-        body["targetIdentifier"] = action["targetIdentifier"]
-    return body
-
-
 def split_actions(
     actions: list[dict[str, Any]],
     *,
-    style: str,
     user_map: dict[str, str],
     team_map: dict[str, str],
 ) -> tuple[list[dict[str, Any]], list[str]]:
@@ -289,10 +258,7 @@ def split_actions(
         if not is_keepable_action(action):
             dropped.append(action_label(action))
             continue
-        if style == "workflow":
-            rewritten = kept_workflow_action(action, user_map, team_map)
-        else:
-            rewritten = kept_classic_action(action, user_map, team_map)
+        rewritten = kept_workflow_action(action, user_map, team_map)
         if rewritten is None:
             dropped.append(action_label(action) + " (target is not a member of the destination org yet)")
             continue
@@ -475,7 +441,6 @@ def workflow_create_body(
             continue
         kept, rejected = split_actions(
             list(action_filter.get("actions") or []),
-            style="workflow",
             user_map=user_map,
             team_map=team_map,
         )
@@ -524,80 +489,6 @@ def workflow_create_body(
     if owner:
         body["owner"] = owner
     return body, dropped
-
-
-def classic_rule_body(
-    rule: dict[str, Any],
-    owner: str | None,
-    user_map: dict[str, str],
-    team_map: dict[str, str],
-) -> tuple[dict[str, Any], list[str]]:
-    kept, dropped = split_actions(
-        list(rule.get("actions") or []),
-        style="classic",
-        user_map=user_map,
-        team_map=team_map,
-    )
-    body: dict[str, Any] = {
-        "name": rule.get("name"),
-        "actionMatch": rule.get("actionMatch") or "all",
-        "filterMatch": rule.get("filterMatch") or "all",
-        "frequency": rule.get("frequency") or 30,
-        "environment": rule.get("environment"),
-        "conditions": rule.get("conditions") or [],
-        "filters": rule.get("filters") or [],
-        "actions": kept,
-    }
-    if owner:
-        body["owner"] = owner
-    return body, dropped
-
-
-def metric_rule_body(
-    rule: dict[str, Any],
-    project_slugs: list[str],
-    owner: str | None,
-    user_map: dict[str, str],
-    team_map: dict[str, str],
-) -> tuple[dict[str, Any], list[str]]:
-    dropped: list[str] = []
-    triggers = []
-    for trigger in rule.get("triggers") or []:
-        if not isinstance(trigger, dict):
-            continue
-        kept, rejected = split_actions(
-            list(trigger.get("actions") or []),
-            style="workflow",
-            user_map=user_map,
-            team_map=team_map,
-        )
-        dropped.extend(rejected)
-        item = {
-            "label": trigger.get("label"),
-            "alertThreshold": trigger.get("alertThreshold"),
-            "actions": kept,
-        }
-        if "resolveThreshold" in trigger:
-            item["resolveThreshold"] = trigger.get("resolveThreshold")
-        triggers.append(item)
-    body: dict[str, Any] = {
-        "name": rule.get("name"),
-        "aggregate": rule.get("aggregate"),
-        "query": rule.get("query") or "",
-        "timeWindow": rule.get("timeWindow"),
-        "projects": project_slugs,
-        "environment": rule.get("environment"),
-        "dataset": rule.get("dataset"),
-        "queryType": rule.get("queryType"),
-        "eventTypes": rule.get("eventTypes"),
-        "thresholdType": rule.get("thresholdType"),
-        "triggers": triggers,
-    }
-    if rule.get("comparisonDelta") is not None:
-        body["comparisonDelta"] = rule["comparisonDelta"]
-    if owner:
-        body["owner"] = owner
-    return {key: value for key, value in body.items() if value is not None}, dropped
 
 
 def dashboard_body(dashboard: dict[str, Any], project_map: dict[str, str], team_map: dict[str, str]) -> dict[str, Any]:
@@ -672,6 +563,28 @@ def saved_query_body(query: dict[str, Any], project_map: dict[str, str]) -> dict
         "version": query.get("version") or 2,
     }
     return {key: value for key, value in body.items() if value is not None}
+
+
+# Top-level fields of an Explore saved query that its create endpoint accepts back.
+EXPLORE_QUERY_KEYS = (
+    "dataset",
+    "query",
+    "environment",
+    "statsPeriod",
+    "start",
+    "end",
+    "interval",
+    "crossEvents",
+    "agent",
+    "errorsOnly",
+)
+
+
+def explore_query_body(query: dict[str, Any], project_map: dict[str, str]) -> dict[str, Any]:
+    body = {key: query[key] for key in EXPLORE_QUERY_KEYS if query.get(key) is not None}
+    body["name"] = query.get("name")
+    body["projects"] = remap_project_ids(list(query.get("projects") or []), project_map)
+    return body
 
 
 def issue_view_body(view: dict[str, Any], project_map: dict[str, str]) -> dict[str, Any]:

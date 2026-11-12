@@ -31,12 +31,12 @@ class MemoryOrg:
         self.projects: dict[str, dict[str, Any]] = {}
         self.members: list[dict[str, Any]] = []
         self.workflows: list[dict[str, Any]] = []
-        self.alert_rules: list[dict[str, Any]] = []
         self.monitors: list[dict[str, Any]] = []
         self.org_detectors: list[dict[str, Any]] = []
         self.dashboards: list[dict[str, Any]] = []
         self.queries: list[dict[str, Any]] = []
-        self.recent_searches: list[dict[str, Any]] = []
+        self.invite_requests: list[dict[str, Any]] = []
+        self.explore_queries: list[dict[str, Any]] = []
         self.views: list[dict[str, Any]] = []
         self.forwarders: list[dict[str, Any]] = []
         self.integrations: list[dict[str, Any]] = []
@@ -99,6 +99,8 @@ class FakeSentry:
             return self._organization(org, method, body)
         if path == f"/organizations/{slug}/teams/":
             return self._teams(org, method, body)
+        if path == f"/organizations/{slug}/invite-requests/":
+            return _ok(org.invite_requests)
         if path == f"/organizations/{slug}/members/":
             return self._members(org, method, body)
         if path == f"/organizations/{slug}/projects/":
@@ -111,8 +113,6 @@ class FakeSentry:
             return _ok([item for item in org.workflows if all_projects or item.get("detectorIds")])
         if path == f"/organizations/{slug}/workflows/":
             return self._collection(org.workflows, method, body)
-        if path == f"/organizations/{slug}/alert-rules/":
-            return self._collection(org.alert_rules, method, body)
         if path == f"/organizations/{slug}/monitors/" and method == "POST":
             return self._create_monitor(org, body)
         if path == f"/organizations/{slug}/monitors/":
@@ -121,8 +121,8 @@ class FakeSentry:
             return self._collection(org.dashboards, method, body, id_field="title")
         if path == f"/organizations/{slug}/discover/saved/":
             return self._collection(org.queries, method, body)
-        if path == f"/organizations/{slug}/recent-searches/":
-            return self._collection(org.recent_searches, method, body)
+        if path == f"/organizations/{slug}/explore/saved/":
+            return self._collection(org.explore_queries, method, body)
         if path == f"/organizations/{slug}/group-search-views/":
             return self._views(org, method, body, params.get("createdBy"))
         if path == f"/organizations/{slug}/forwarding/":
@@ -177,9 +177,6 @@ class FakeSentry:
             return _ok(org.projects[environments.group(1)]["environments"])
         if environments and method == "PUT":
             return self._hide_environments(org, environments.group(1), body)
-        rules = re.fullmatch(rf"/projects/{slug}/([^/]+)/rules/?", path)
-        if rules:
-            return self._rules(org, rules.group(1), method, body)
         codeowners = re.fullmatch(rf"/projects/{slug}/([^/]+)/codeowners/?", path)
         if codeowners and method == "GET":
             return _ok(org.projects[codeowners.group(1)]["codeowners"])
@@ -317,7 +314,6 @@ class FakeSentry:
                 }
             ],
             "environments": [],
-            "rules": [],
             "codeowners": [],
             "hooks": [],
             "detectors": [
@@ -403,14 +399,6 @@ class FakeSentry:
             if item["name"] in body.get("environmentNames", []):
                 item["isHidden"] = body.get("isHidden")
         return _ok(org.projects[slug]["environments"])
-
-    def _rules(self, org: MemoryOrg, slug: str, method: str, body: dict[str, Any]) -> httpx.Response:
-        rules = org.projects[slug]["rules"]
-        if method == "GET":
-            return _ok(rules)
-        created = {"id": _next_from(rules), **body}
-        rules.append(created)
-        return _ok(created, 201)
 
     def _create_detector(self, org: MemoryOrg, slug: str, body: dict[str, Any]) -> httpx.Response:
         project = org.projects[slug]
@@ -551,25 +539,6 @@ def seed() -> FakeSentry:
             {"name": "production", "isHidden": False},
             {"name": "staging", "isHidden": True},
         ],
-        "rules": [
-            {
-                "id": "r1",
-                "name": "Notify on new issue",
-                "actionMatch": "any",
-                "conditions": [{"id": "sentry.rules.conditions.first_seen_event.FirstSeenEventCondition"}],
-                "actions": [{"id": "sentry.mail.actions.NotifyEmailAction", "targetType": "IssueOwners"}],
-            },
-            {
-                "id": "r2",
-                "name": "After hours",
-                "actionMatch": "all",
-                "conditions": [{"id": "sentry.rules.conditions.first_seen_event.FirstSeenEventCondition"}],
-                "actions": [
-                    {"id": "sentry.mail.actions.NotifyEmailAction", "targetType": "IssueOwners"},
-                    {"id": "sentry.integrations.slack.notify_action.SlackNotifyServiceAction", "workspace": "T1"},
-                ],
-            },
-        ],
         "codeowners": [{"id": "co1", "raw": "* @backend"}],
         "hooks": [{"url": "https://example.com/hook", "events": ["event.alert"], "secret": "hook-secret"}],
         "detectors": [
@@ -659,28 +628,6 @@ def seed() -> FakeSentry:
             ],
         }
     )
-    source.alert_rules.append(
-        {
-            "id": "a1",
-            "name": "Error spike",
-            "aggregate": "count()",
-            "query": "is:unresolved",
-            "timeWindow": 60,
-            "projects": ["10"],
-            "dataset": "events",
-            "thresholdType": 0,
-            "triggers": [
-                {
-                    "label": "critical",
-                    "alertThreshold": 100,
-                    "actions": [
-                        {"type": "email", "integrationId": None, "config": {"targetType": "team", "targetIdentifier": "1"}},
-                        {"type": "slack", "integrationId": "9", "config": {"targetType": "specific"}},
-                    ],
-                }
-            ],
-        }
-    )
     source.monitors.append(
         {
             "id": "mon1",
@@ -725,7 +672,24 @@ def seed() -> FakeSentry:
             "version": 2,
         }
     )
-    source.recent_searches.append({"id": "rs1", "type": 0, "query": "is:unresolved level:error"})
+    source.invite_requests.append(
+        {"id": "ir1", "email": "pending@example.com", "orgRole": "member", "inviteStatus": "requested_to_join"}
+    )
+    source.explore_queries.extend(
+        [
+            {
+                "id": "e1",
+                "name": "Slow spans",
+                "projects": [10],
+                "dataset": "spans",
+                "query": [{"query": "span.op:db", "fields": ["span.description"], "mode": "samples"}],
+                "statsPeriod": "24h",
+                "isPrebuilt": False,
+                "createdBy": {"id": "1"},
+            },
+            {"id": "e2", "name": "All Transactions", "projects": [], "dataset": "spans", "query": [{}], "isPrebuilt": True},
+        ]
+    )
     source.views.extend(
         [
             {
@@ -796,7 +760,6 @@ def _seed_alert_shapes(source: MemoryOrg) -> None:
         "ownership": None,
         "keys": [],
         "environments": [],
-        "rules": [],
         "codeowners": [],
         "hooks": [],
         "detectors": [{"id": "d6", "projectId": "11", "name": "Issue stream", "type": "issue_stream"}],

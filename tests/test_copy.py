@@ -10,6 +10,7 @@ import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
 from pathlib import Path
+from typing import Any
 from unittest import mock
 
 import httpx
@@ -17,6 +18,11 @@ import httpx
 from org_copy import cli, session
 from org_copy.cli import main
 from org_copy.client import SentryClient, next_link
+from org_copy.apply import ApplyReport, SectionResult, Sink
+from org_copy.checkpoint import render_checkpoint
+from org_copy.export import _attach_detectors
+from org_copy.progress import Progress
+from org_copy.summary import render_summary
 from tests.fake_sentry import FakeSentry, MemoryOrg, seed
 
 # Tests never read or write the real per-terminal credentials file.
@@ -98,6 +104,8 @@ class CopyTests(unittest.TestCase):
             self.assertIn("saml2", checklist)
             self.assertIn("CI Upload", checklist)
             self.assertIn("staging", checklist)
+            self.assertIn("Waiting for approval in the source", checklist)
+            self.assertIn("- pending@example.com role `member`", checklist)
             self.assertEqual(stat.S_IMODE(os.stat("snapshot.json").st_mode), 0o600)
 
             dest = fake.orgs[("de.sentry.io", "sana-de")]
@@ -176,19 +184,17 @@ class CopyTests(unittest.TestCase):
         self.assertTrue(all(action["type"] == "email" for action in actions))
         team_action = next(action for action in actions if action["config"]["targetType"] == "team")
         self.assertEqual(team_action["config"]["targetIdentifier"], dest.teams["backend"]["id"])
-        self.assertEqual(len(project["rules"]), 1)
-        self.assertEqual(project["rules"][0]["name"], "After hours")
-        self.assertEqual(dest.alert_rules[0]["projects"], ["api"])
-        self.assertNotIn("slack", json.dumps(dest.alert_rules[0]["triggers"]).lower())
         self.assertEqual(dest.monitors[0]["slug"], "nightly")
         self.assertEqual(dest.dashboards[0]["title"], "Overview")
         self.assertEqual(dest.dashboards[0]["projects"], [int(project["id"])])
         self.assertEqual(len(dest.dashboards), 1)
         self.assertEqual(dest.queries[0]["projects"], [int(project["id"])])
         self.assertEqual(dest.queries[0]["version"], 2)
-        self.assertEqual(len(dest.recent_searches), 1)
-        self.assertEqual(dest.recent_searches[0]["query"], "is:unresolved level:error")
-        self.assertEqual([view["name"] for view in dest.views], ["Prod errors"])
+        self.assertEqual([query["name"] for query in dest.explore_queries], ["Slow spans"])
+        self.assertEqual(dest.explore_queries[0]["projects"], [int(project["id"])])
+        self.assertEqual(dest.explore_queries[0]["query"][0]["query"], "span.op:db")
+        self.assertNotIn("createdBy", dest.explore_queries[0])
+        self.assertEqual([view["name"] for view in dest.views], ["Prod errors", "Someone else"])
         self.assertEqual(dest.forwarders[0]["config"]["token"], "super-secret-splunk-token")
         self.assertEqual(dest.forwarders[0]["project_ids"], [int(project["id"])])
         invited = [member for member in dest.members if member["email"] == "other@example.com"]
@@ -333,7 +339,7 @@ class GuidedTests(unittest.TestCase):
             "Destination host [https://de.sentry.io]: ": "",
             "Choose 1 or 2: ": choice,
             "Email invites to the source members now? [y/N]: ": invites,
-            "Write the changes above to sana-de? [y/N]: ": write,
+            "Do the numbers above look right? Write the changes to sana-de? [y/N]: ": write,
         }
         previous = os.getcwd()
         work = tempfile.TemporaryDirectory()
@@ -363,19 +369,154 @@ class GuidedTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual([call for call in dest.calls if call[0] != "GET"], [])
         self.assertIn("Nothing was written to sana-de", err)
+        self.assertIn("  [12/12] Integrations, apps, and auth tokens: done", err)
+        self.assertIn("  [5/12] Projects: 2 to create, 9 related changes", err)
+        self.assertIn("  [8/12] Monitors: 2 to create, 4 not copied", err)
+        self.assertIn("Check before writing to sana-de", err)
+        self.assertRegex(err, r"\n  Monitors +6 +2 +0 +4\n")
+        self.assertIn("  Explore saved queries: 2 in sana-us, 1 to create\n    1 prebuilt, the destination has its own: All Transactions\n", err)
+        self.assertIn(
+            "Why the numbers differ:\n"
+            "  Monitors: 6 in sana-us, 2 to create\n"
+            "    3 built in, the new project gets its own: Issue stream on api, Nightly on api, Issue stream on web\n",
+            err,
+        )
+        self.assertIn("  Dashboards: 2 in sana-us, 1 to create\n    1 prebuilt, the destination has its own: Prebuilt\n", err)
+        self.assertIn("  [12/12] Issue views: 2 to create", err)
 
     def test_start_migration_runs_end_to_end(self) -> None:
         code, dest, err = self._guided("1")
         self.assertEqual(code, 0)
         self.assertEqual(sorted(dest.projects), ["api", "web"])
         self.assertFalse([call for call in dest.calls if call[0] == "POST" and call[1].endswith("/members/")])
-        self.assertIn("start with Review the destination", err)
+        self.assertIn("Writing to sana-de", err)
+        self.assertIn("  [5/12] Projects: 2 created, 8 related changes", err)
+        self.assertIn("  [12/12] Issue views: 2 created", err)
+        summary = err[err.index("Summary for sana-de") :]
+        self.assertIn("Migrated:\n  Organization settings: 1 updated\n  Teams: 1 created\n", summary)
+        self.assertIn("Went wrong: nothing.", summary)
+        self.assertIn("  - Member invites were not sent.", summary)
+        self.assertIn("      Notify on new issue: slack #alerts", summary)
+        self.assertIn("  - Turn on Require 2FA", summary)
+        self.assertIn("      slack: Workspace", summary)
+        self.assertIn("      api / Production: https://", summary)
 
     def test_start_migration_can_be_stopped_before_writing(self) -> None:
         code, dest, err = self._guided("1", write="n")
         self.assertEqual(code, 1)
         self.assertEqual([call for call in dest.calls if call[0] != "GET"], [])
         self.assertIn("Stopped. Nothing was written to sana-de", err)
+
+
+class SummaryTests(unittest.TestCase):
+    def test_lists_failures_from_export_and_apply(self) -> None:
+        report = ApplyReport(
+            failures=[{"step": "project web", "detail": "403 forbidden"}],
+            sections=[SectionResult("Projects", "1 created, 1 failed")],
+        )
+        snapshot = {"exportErrors": [{"step": "dashboards", "detail": "404"}]}
+        text = render_summary(snapshot, report, "sana-de")
+        self.assertIn("Migrated:\n  Projects: 1 created, 1 failed\n", text)
+        self.assertIn(
+            "Went wrong (2):\n  - Reading the source, dashboards: 404\n  - project web: 403 forbidden\n", text
+        )
+        self.assertIn("Still to do: nothing.", text)
+
+
+class CheckpointTests(unittest.TestCase):
+    def test_explains_every_alert_that_is_not_created(self) -> None:
+        actions = [
+            "create workflow Errors",
+            "skip workflow Errors (not copied: duplicate of another in the source)",
+            *(f"skip workflow Latency {n}" for n in range(1, 6)),
+            "create detector Slow on api",
+        ]
+        report = ApplyReport(
+            sections=[
+                SectionResult("Alerts", "", actions, [{"step": "workflow Crons", "detail": "monitor was not copied"}])
+            ]
+        )
+        snapshot = {"workflows": [{}] * 9}
+        text = render_checkpoint(snapshot, report, "src-org", "dest-org")
+        self.assertIn("  Alerts       9          1              5           3\n", text)
+        self.assertIn(
+            "Why the numbers differ:\n"
+            "  Alerts: 9 in src-org, 1 to create\n"
+            "    5 already in dest-org (same name and monitors): Latency 1, Latency 2, Latency 3, and 2 more\n"
+            "    1 duplicate of another in the source: Errors\n"
+            "    1 failed, listed under Went wrong: Crons: monitor was not copied\n"
+            "    1 not in the plan, such as an entry with no name\n",
+            text,
+        )
+
+
+    def test_sink_tells_duplicates_from_objects_already_there(self) -> None:
+        report = ApplyReport()
+        sink = Sink(None, report, dry_run=True)  # type: ignore[arg-type]
+        sink.post("/organizations/dest-org/dashboards/", {"title": "Errors"}, "dashboard Errors")
+        sink.skip("dashboard Errors")
+        sink.skip("dashboard Latency")
+        self.assertEqual(
+            report.actions,
+            [
+                "create dashboard Errors",
+                "skip dashboard Errors (not copied: duplicate of another in the source)",
+                "skip dashboard Latency",
+            ],
+        )
+
+
+class AttachDetectorsTests(unittest.TestCase):
+    def test_reports_monitors_whose_project_was_not_read(self) -> None:
+        projects = [{"id": "10", "slug": "api", "detectors": []}]
+        detectors = [
+            {"id": "1", "name": "Slow api", "projectId": "10"},
+            {"id": "2", "name": "Slow web", "projectId": "11"},
+            {"id": "3", "name": "All projects"},
+        ]
+        errors: list[dict[str, Any]] = []
+        org_level = _attach_detectors(projects, detectors, errors)
+        self.assertEqual([item["name"] for item in org_level], ["All projects"])
+        self.assertEqual([item["name"] for item in projects[0]["detectors"]], ["Slow api"])
+        self.assertEqual(
+            errors,
+            [
+                {
+                    "step": "monitors in project 11",
+                    "status": 0,
+                    "detail": "the project was not read, so these monitors were not copied (1): Slow web",
+                }
+            ],
+        )
+
+
+class TerminalStream(StringIO):
+    def isatty(self) -> bool:
+        return True
+
+
+class ProgressTests(unittest.TestCase):
+    def test_terminal_counts_items_on_the_section_line(self) -> None:
+        stream = TerminalStream()
+        progress = Progress("Reading sana-us", 1, stream)
+        with progress.section("Projects") as summary:
+            for _ in progress.items(["api", "web"]):
+                pass
+            summary.append("2 found")
+        lines = stream.getvalue().split("\r\033[K")
+        self.assertEqual(lines[0], "Reading sana-us\n")
+        self.assertEqual(lines[1:4], ["  [1/1] Projects...", "  [1/1] Projects... 1/2", "  [1/1] Projects... 2/2"])
+        self.assertRegex(lines[4], r"^  \[1/1\] Projects: 2 found \(\d+\.\ds\)\n$")
+
+    def test_log_gets_one_line_when_a_section_starts_and_ends(self) -> None:
+        stream = StringIO()
+        progress = Progress("Writing to sana-de", 1, stream)
+        with progress.section("Teams"):
+            for _ in progress.items(["backend"]):
+                pass
+        self.assertRegex(
+            stream.getvalue(), r"^Writing to sana-de\n  \[1/1\] Teams\.\.\.\n  \[1/1\] Teams: done \(\d+\.\ds\)\n$"
+        )
 
 
 class CredentialTests(unittest.TestCase):
