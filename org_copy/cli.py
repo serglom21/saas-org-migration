@@ -7,6 +7,7 @@ import getpass
 import os
 import sys
 
+from org_copy import session
 from org_copy.apply import ApplyOptions, apply_snapshot
 from org_copy.checklist import render_checklist
 from org_copy.client import ApiError, SentryClient
@@ -147,16 +148,23 @@ def _confirm(question: str) -> bool:
 
 
 def _org_and_token(prefix: str, label: str) -> tuple[str, str]:
-    """Ask for {prefix}_ORG and {prefix}_TOKEN on every run.
+    """Ask for {prefix}_ORG and {prefix}_TOKEN, or offer the ones entered earlier in this terminal.
 
     Values already in the environment are ignored and removed, so a run never
-    reuses an org or token left over from an earlier session.
+    reuses an org or token left over from another shell.
     """
     stale = [name for name in (f"{prefix}_ORG", f"{prefix}_TOKEN") if os.environ.pop(name, None) is not None]
     if stale:
-        print(f"Ignoring {' and '.join(stale)} from the environment. Enter them again.", file=sys.stderr)
+        print(f"Ignoring {' and '.join(stale)} from the environment.", file=sys.stderr)
+    saved = session.remembered(prefix)
+    if saved is not None and sys.stdin.isatty():
+        org, token = saved
+        answer = input(f"{label} org {org}, token {session.masked(token)}. Use them again? [Y/n]: ")
+        if answer.strip().lower() in ("", "y", "yes"):
+            return saved
     org = _ask(f"{label} org slug: ", f"{prefix}_ORG", secret=False)
     token = _ask(f"{label} token: ", f"{prefix}_TOKEN", secret=True)
+    session.remember(prefix, org, token)
     return org, token
 
 

@@ -44,7 +44,15 @@ Integration tokens can't change these, whatever their scopes. Set them by hand o
 
 You don't need to set any environment variables. When it starts, `org-copy` asks for the details of both orgs. Tokens are not echoed.
 
-It asks on every run, so a run never reuses an org or token from an earlier session. If `SOURCE_ORG`, `SOURCE_TOKEN`, `DEST_ORG`, or `DEST_TOKEN` is set in the environment, `org-copy` ignores it, removes it for that run, and asks again. It needs a terminal; without one, such as in CI, it stops with an error.
+It remembers what you enter until you close the terminal. The next run in the same terminal shows each org and the start and end of its token, and asks whether to use them again:
+
+```
+Source org my-us-org, token sntr...9f3a. Use them again? [Y/n]:
+```
+
+Press Enter to reuse them, or `n` to enter new ones. A new terminal always asks again. The values are kept in a file that only you can read, under `$XDG_RUNTIME_DIR` or your temp directory, named after the terminal's session. Once the terminal is closed the file is never read again, and the next `org-copy` run deletes it.
+
+If `SOURCE_ORG`, `SOURCE_TOKEN`, `DEST_ORG`, or `DEST_TOKEN` is set in the environment, `org-copy` ignores it and removes it for that run. It needs a terminal; without one, such as in CI, it stops with an error.
 
 Do not commit the tokens. They cannot be passed as command-line flags, so they stay out of shell history.
 

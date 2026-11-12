@@ -14,10 +14,21 @@ from unittest import mock
 
 import httpx
 
-from org_copy import cli
+from org_copy import cli, session
 from org_copy.cli import main
 from org_copy.client import SentryClient, next_link
 from tests.fake_sentry import FakeSentry, MemoryOrg, seed
+
+# Tests never read or write the real per-terminal credentials file.
+_no_session = mock.patch("org_copy.session._session", return_value=None)
+
+
+def setUpModule() -> None:
+    _no_session.start()
+
+
+def tearDownModule() -> None:
+    _no_session.stop()
 
 
 class ClientTests(unittest.TestCase):
@@ -368,7 +379,7 @@ class GuidedTests(unittest.TestCase):
 
 
 class CredentialTests(unittest.TestCase):
-    def test_always_asks_for_org_and_token(self) -> None:
+    def test_asks_for_org_and_token_when_none_were_saved(self) -> None:
         with (
             mock.patch.dict(os.environ, {}, clear=True),
             mock.patch("sys.stdin.isatty", return_value=True),
@@ -401,6 +412,61 @@ class CredentialTests(unittest.TestCase):
         ):
             with self.assertRaisesRegex(SystemExit, "DEST_ORG"):
                 cli._org_and_token("DEST", "Destination")
+
+
+class SessionTests(unittest.TestCase):
+    def setUp(self) -> None:
+        work = tempfile.TemporaryDirectory()
+        self.addCleanup(work.cleanup)
+        self.directory = Path(work.name) / "org-copy"
+        for patch in (
+            mock.patch("org_copy.session._session", return_value=os.getpid()),
+            mock.patch("org_copy.session._terminal", return_value="/dev/ttys001"),
+            mock.patch("org_copy.session._directory", return_value=self.directory),
+            mock.patch.dict(os.environ, {}, clear=True),
+            mock.patch("sys.stdin.isatty", return_value=True),
+        ):
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def _ask(self, answers: dict[str, str]) -> tuple[str, str]:
+        with (
+            mock.patch("builtins.input", side_effect=answers.__getitem__),
+            mock.patch("getpass.getpass", side_effect=answers.__getitem__),
+        ):
+            return cli._org_and_token("DEST", "Destination")
+
+    def test_offers_the_org_and_token_from_earlier_in_this_terminal(self) -> None:
+        token = "sntrys_0123456789abcdef"
+        self.assertEqual(
+            self._ask({"Destination org slug: ": "sana-de", "Destination token: ": token}), ("sana-de", token)
+        )
+        file = self.directory / f"{os.getpid()}.json"
+        self.assertEqual(stat.S_IMODE(file.stat().st_mode), 0o600)
+        self.assertEqual(stat.S_IMODE(self.directory.stat().st_mode), 0o700)
+        offer = "Destination org sana-de, token sntr...cdef. Use them again? [Y/n]: "
+        self.assertEqual(self._ask({offer: ""}), ("sana-de", token))
+        self.assertEqual(
+            self._ask({offer: "n", "Destination org slug: ": "other-de", "Destination token: ": "other-token"}),
+            ("other-de", "other-token"),
+        )
+        self.assertEqual(session.remembered("DEST"), ("other-de", "other-token"))
+
+    def test_forgets_terminals_that_were_closed_or_reused(self) -> None:
+        self.directory.mkdir(mode=0o700)
+        closed = self.directory / "999999999.json"
+        closed.write_text(json.dumps({"tty": "/dev/ttys009", "DEST": {"org": "old", "token": "old-token"}}))
+        reused = self.directory / f"{os.getpid()}.json"
+        reused.write_text(json.dumps({"tty": "/dev/ttys002", "DEST": {"org": "old", "token": "old-token"}}))
+        self.assertIsNone(session.remembered("DEST"))
+        self.assertFalse(closed.exists())
+        self.assertFalse(reused.exists())
+
+    def test_does_not_save_into_a_directory_others_can_read(self) -> None:
+        self.directory.mkdir(mode=0o755)
+        os.chmod(self.directory, 0o755)
+        session.remember("DEST", "sana-de", "de-token")
+        self.assertEqual(list(self.directory.iterdir()), [])
 
 
 def _run(args: list[str], stdout: StringIO | None = None) -> int:
